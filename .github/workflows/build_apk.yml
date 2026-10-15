@@ -1,0 +1,169 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'public/apk/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Firebase Config from Secret
+        run: |
+          cat << 'EOF' > firebase-applet-config.json
+          ${{ secrets.FIREBASE_CONFIG }}
+          EOF
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install and Build Web
+        run: |
+          npm install --legacy-peer-deps --no-audit
+          npm run build
+          mkdir -p assets/web
+          cp -r dist/* assets/web/ 2>/dev/null || true
+          cp -r public/* assets/web/ 2>/dev/null || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+
+      - name: Precache Flutter Android Artifacts
+        run: flutter precache --android
+
+      - name: Configure Android Build & Fix Dependencies
+        run: |
+          if [ -f scripts/prepare_android.py ]; then
+            python3 scripts/prepare_android.py
+          fi
+
+          # 1. Clean broken XML launcher icons
+          find android/app/src/main/res -name "ic_launcher*.xml" -delete || true
+
+          # 2. Generate clean valid Android PNG launcher icons
+          python3 -m pip install pillow --quiet
+          python3 -c "
+          import os
+          from PIL import Image
+
+          densities = {'mipmap-mdpi': 48, 'mipmap-hdpi': 72, 'mipmap-xhdpi': 96, 'mipmap-xxhdpi': 144, 'mipmap-xxxhdpi': 192}
+          logo = next((p for p in ['assets/web/logo.jpg', 'assets/web/logo.png', 'public/logo.png', 'dist/logo.png'] if os.path.exists(p)), None)
+
+          for folder, size in densities.items():
+              d = os.path.join('android/app/src/main/res', folder)
+              os.makedirs(d, exist_ok=True)
+              p = os.path.join(d, 'ic_launcher.png')
+              if logo:
+                  try:
+                      Image.open(logo).convert('RGBA').resize((size, size)).save(p, 'PNG')
+                      continue
+                  except Exception:
+                      pass
+              Image.new('RGBA', (size, size), (0, 122, 75, 255)).save(p, 'PNG')
+          "
+
+          # 3. Configure local.properties and gradle repositories
+          FLUTTER_BIN=$(which flutter)
+          FLUTTER_DIR=$(dirname $(dirname "$FLUTTER_BIN"))
+          echo "flutter.sdk=$FLUTTER_DIR" > android/local.properties
+
+          python3 -c "
+          import os, re
+
+          # 3A. Pin geolocator_android to 4.6.1 to fix flutter.compileSdkVersion crash
+          if os.path.exists('pubspec.yaml'):
+              with open('pubspec.yaml', 'r') as f:
+                  p = f.read()
+              if 'geolocator_android: 4.6.1' not in p:
+                  p += '\ndependency_overrides:\n  geolocator_android: 4.6.1\n'
+                  with open('pubspec.yaml', 'w') as f:
+                      f.write(p)
+                  print('Pinned geolocator_android to 4.6.1')
+
+          # 3B. Fix settings.gradle plugin loader
+          if os.path.exists('android/settings.gradle'):
+              with open('android/settings.gradle', 'r') as f:
+                  st = f.read()
+              st = st.replace('id \"dev.flutter.flutter-gradle-plugin\" version \"1.0.0\" apply false', 'id \"dev.flutter.flutter-plugin-loader\" version \"1.0.0\"')
+              with open('android/settings.gradle', 'w') as f:
+                  f.write(st)
+
+          # 3C. Clean root build.gradle
+          if os.path.exists('android/build.gradle'):
+              with open('android/build.gradle', 'r') as f:
+                  c = f.read()
+              if 'afterEvaluate' in c:
+                  c = re.sub(r'subprojects\s*\{\s*afterEvaluate[\s\S]*?\}\s*\}\s*\}', '', c).strip()
+              if 'download.flutter.io' not in c:
+                  c = c.replace('mavenCentral()', 'mavenCentral()\n        maven { url \"https://storage.googleapis.com/download.flutter.io\" }')
+              with open('android/build.gradle', 'w') as f:
+                  f.write(c)
+              print('Cleaned android/build.gradle')
+          "
+
+      - name: Build Android Release APK
+        run: |
+          flutter clean
+          flutter pub get
+          flutter build apk --release --no-tree-shake-icons
+
+      - name: Stage APK Files & Generate Version Manifest
+        run: |
+          mkdir -p public/apk
+          cp build/app/outputs/flutter-apk/app-release.apk public/apk/sahayasewa-latest.apk
+          cp build/app/outputs/flutter-apk/app-release.apk public/apk/app-release.apk
+          cat << 'EOF' > public/apk/version.json
+          {
+            "versionCode": 2,
+            "versionName": "1.1",
+            "appName": "Sahaya Sewa",
+            "downloadPath": "/apk/sahayasewa-latest.apk"
+          }
+          EOF
+
+      - name: Upload APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: v1.1
+          name: "Sahaya Sewa v1.1"
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            public/apk/sahayasewa-latest.apk
+            public/apk/app-release.apk
+            public/apk/version.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
