@@ -1,5 +1,3 @@
-AdminPanel.tsx (Full 827 Lines)
-Sahaya Sewa - Original Full 827-line AdminPanel Component Source Code
 import React, { useState, useMemo } from 'react';
 import { 
   User, 
